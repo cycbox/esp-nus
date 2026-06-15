@@ -1,0 +1,63 @@
+menu "UART<->BLE Bridge"
+
+    config BRIDGE_BLE_NAME
+        string "Advertised BLE device name"
+        default "ESP-NUS"
+
+    config BRIDGE_UART_PORT_NUM
+        int "UART port number"
+        default 0
+        range 0 1
+
+    config BRIDGE_UART_BAUD_RATE
+        int "UART baud rate"
+        default 921600
+
+    config BRIDGE_UART_TX_GPIO
+        int "UART TX GPIO"
+        default 16
+
+    config BRIDGE_UART_RX_GPIO
+        int "UART RX GPIO"
+        default 17
+
+    config BRIDGE_UART_FLOW_CTRL
+        bool "Enable UART hardware (RTS/CTS) flow control"
+        default n
+        help
+            Strongly recommended at high baud rates to prevent RX overruns when
+            the BLE link briefly stalls.
+
+    config BRIDGE_UART_RTS_GPIO
+        int "UART RTS GPIO"
+        default 6
+        depends on BRIDGE_UART_FLOW_CTRL
+
+    config BRIDGE_UART_CTS_GPIO
+        int "UART CTS GPIO"
+        default 7
+        depends on BRIDGE_UART_FLOW_CTRL
+
+    config BRIDGE_UART_RX_BUF_SIZE
+        int "UART driver RX buffer size (bytes)"
+        default 8192
+        help
+            Headroom to absorb UART input while the BLE link drains it.
+
+    config BRIDGE_UART_TX_BUF_SIZE
+        int "UART driver TX buffer size (bytes)"
+        default 8192
+
+    config BRIDGE_UART_RX_CHUNK
+        int "UART read chunk size (bytes)"
+        default 1024
+
+    config BRIDGE_UART_RX_TIMEOUT_MS
+        int "UART read timeout (ms)"
+        default 20
+
+    config BRIDGE_BLE_TO_UART_BUF_SIZE
+        int "BLE->UART stream buffer size (bytes)"
+        default 16384
+
+endmenu
