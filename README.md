@@ -3,6 +3,12 @@
 A transparent UART-BLE cable replacement for the ESP32-C6, exposing the
 Nordic UART Service (NUS) and tuned for throughput.
 
+<p align="center">
+  <img src="esp32-c6-devkitc.webp" alt="ESP32-C6-DevKitC test board" width="420">
+</p>
+
+> Tested on the ESP32-C6-DevKitC.
+
 Bytes arriving on the hardware UART RX pin are streamed to the connected BLE
 central as TX notifications; bytes the central writes to the RX characteristic
 are clocked out the UART TX pin.
