@@ -38,8 +38,7 @@ typedef struct {
   void *cb_arg;                // passed back to both callbacks
 } ble_nus_config_t;
 
-// Bring up NimBLE and start advertising. Returns once the host task is running;
-// the link is not yet connected at this point. Call once.
+// Bring up NimBLE and start advertising.
 esp_err_t ble_nus_init(const ble_nus_config_t *config);
 
 // Queue `len` bytes to the peer over the TX characteristic, fragmenting to the

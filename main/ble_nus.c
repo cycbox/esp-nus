@@ -17,10 +17,12 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
+#include "nimble/nimble_npl.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
@@ -29,17 +31,31 @@
 
 static const char *TAG = "ble_nus";
 
-// Number of notifications allowed in flight at once. Kept comfortably below the
-// msys block budget (see sdkconfig.defaults) so ble_hs_mbuf_from_flat() does not
-// fail under load. More credits -> deeper pipeline -> higher throughput, up to
-// the point the controller's ACL buffers saturate. With a 244 B payload now
-// fitting in one msys block, 16 credits stay well under the 64-block pool while
-// keeping the controller's ACL queue (ACL_FROM_LL_COUNT=30) fed.
-#define NUS_TX_CREDITS 16
+// Preferred ATT MTU. 247 is the sweet spot: payload = MTU - 3 = 244 B, which
+// becomes a 247 B ATT PDU + 4 B L2CAP header = 251 B = exactly one DLE LL PDU
+// (and one msys block). Each notification is therefore a single, full LL packet
+// with no wasteful trailing fragment, which lets a central (Android in
+// particular) pack whole notifications into each connection event. A larger MTU
+// raises the per-notification ceiling but forces L2CAP fragmentation across
+// multiple LL PDUs with a short, inefficient tail PDU.
+#define NUS_PREFERRED_MTU 247
+
+// Number of notifications allowed in flight at once. Kept below both the msys
+// block budget (MSYS_1_BLOCK_COUNT=64) and the controller's ACL queue
+// (ACL_FROM_LL_COUNT=30) so neither ble_hs_mbuf_from_flat() nor
+// ble_gatts_notify_custom() fails under load. With a 244 B payload now fitting
+// in one msys block / one ACL packet, each credit costs exactly one of each, so
+// 24 stays clear of both limits while keeping the pipeline deep enough to span a
+// 15 ms (Android-typical) connection interval.
+#define NUS_TX_CREDITS 24
+
+// How often to log measured TX throughput and the estimated number of LL PDUs
+// per connection event while a transfer is running.
+#define NUS_STATS_PERIOD_MS 1000
 
 // Connection interval, in 1.25 ms units. 6 == 7.5 ms, the BLE minimum.
 #define NUS_CONN_ITVL_MIN 6
-#define NUS_CONN_ITVL_MAX 6
+#define NUS_CONN_ITVL_MAX 18
 #define NUS_CONN_LATENCY 0
 #define NUS_CONN_TIMEOUT 400 // 4 s, in 10 ms units
 
@@ -65,7 +81,49 @@ static uint16_t s_tx_val_handle;       // value handle of the TX characteristic
 static volatile bool s_tx_subscribed;  // peer enabled notifications on TX
 static SemaphoreHandle_t s_tx_credits; // counting semaphore, NUS_TX_CREDITS
 
+// Periodic throughput/packets-per-event stats. Counters are bumped by the sender
+// (uart_rx_task) and sampled + reset by the callout on the NimBLE host task.
+static struct ble_npl_callout s_stats_co;
+static volatile uint32_t s_stat_notifs; // notifications queued since last sample
+static volatile uint32_t s_stat_bytes;  // app bytes queued since last sample
+static volatile uint32_t s_stat_pdus;   // LL PDUs implied by those notifications
+static int64_t s_stat_last_us;          // timestamp of the last sample
+
+// One-shot retry of our connection-parameter update. The central may run its
+// own update concurrently, colliding with ours (HCI "LL transaction collision");
+// we back off briefly and try once more rather than racing it.
+static struct ble_npl_callout s_param_co;
+static bool s_param_retried;
+
 static void ble_nus_advertise(void);
+
+// Human-readable PHY name for the 1M/2M/Coded enum used in PHY-update events.
+static const char *phy_str(uint8_t phy) {
+  switch (phy) {
+  case BLE_GAP_LE_PHY_1M:
+    return "1M";
+  case BLE_GAP_LE_PHY_2M:
+    return "2M";
+  case BLE_GAP_LE_PHY_CODED:
+    return "Coded";
+  default:
+    return "?";
+  }
+}
+
+// Read back and log the parameters the controller actually settled on for this
+// connection: interval (1.25 ms units), latency, and supervision timeout.
+static void log_conn_params(uint16_t conn_handle) {
+  struct ble_gap_conn_desc desc;
+  int rc = ble_gap_conn_find(conn_handle, &desc);
+  if (rc) {
+    ESP_LOGW(TAG, "conn_find rc=%d", rc);
+    return;
+  }
+  ESP_LOGI(TAG, "conn params: interval=%.2f ms latency=%d timeout=%d ms",
+           desc.conn_itvl * 1.25, desc.conn_latency,
+           desc.supervision_timeout * 10);
+}
 
 static int gatt_rx_access(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt, void *arg) {
@@ -120,6 +178,29 @@ static void tx_credits_reset(void) {
     xSemaphoreGive(s_tx_credits); // caps out at NUS_TX_CREDITS, extra gives fail
 }
 
+// Request our preferred connection interval/latency/timeout. Best-effort: the
+// central may reject it or run its own update that collides with ours (see the
+// retry path in BLE_GAP_EVENT_CONN_UPDATE).
+static void request_conn_params(uint16_t conn_handle) {
+  struct ble_gap_upd_params params = {
+      .itvl_min = NUS_CONN_ITVL_MIN,
+      .itvl_max = NUS_CONN_ITVL_MAX,
+      .latency = NUS_CONN_LATENCY,
+      .supervision_timeout = NUS_CONN_TIMEOUT,
+  };
+  int rc = ble_gap_update_params(conn_handle, &params);
+  if (rc)
+    ESP_LOGW(TAG, "conn param update rc=%d", rc);
+}
+
+// Deferred one-shot retry after a collision with the central's own update.
+static void param_retry_cb(struct ble_npl_event *ev) {
+  if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE)
+    return;
+  ESP_LOGI(TAG, "retrying conn param update after collision");
+  request_conn_params(s_conn_handle);
+}
+
 // Ask the peer for every throughput feature we can. Each is best-effort: a
 // central is free to reject or ignore any of them, so failures are logged but
 // not fatal.
@@ -137,19 +218,46 @@ static void negotiate_fast_params(uint16_t conn_handle) {
   if (rc)
     ESP_LOGW(TAG, "set data len rc=%d", rc);
 
-  // MTU exchange is initiated by the central; our large preferred MTU
+  // MTU exchange is initiated by the central; our preferred MTU
   // (ble_att_set_preferred_mtu) bounds the negotiated result. See
   // BLE_GAP_EVENT_MTU for the settled value.
 
-  struct ble_gap_upd_params params = {
-      .itvl_min = NUS_CONN_ITVL_MIN,
-      .itvl_max = NUS_CONN_ITVL_MAX,
-      .latency = NUS_CONN_LATENCY,
-      .supervision_timeout = NUS_CONN_TIMEOUT,
-  };
-  rc = ble_gap_update_params(conn_handle, &params);
-  if (rc)
-    ESP_LOGW(TAG, "conn param update rc=%d", rc);
+  request_conn_params(conn_handle);
+}
+
+// Sample the TX counters and log measured throughput plus an estimate of how
+// many LL PDUs the link is pushing per connection event. The controller does
+// not expose the real per-event packet count, so we derive it: PDUs sent over
+// the sample window, divided by the number of connection events in that window
+// (window / interval). With 244 B payloads each notification is one LL PDU.
+static void stats_timer_cb(struct ble_npl_event *ev) {
+  uint32_t notifs = s_stat_notifs;
+  uint32_t bytes = s_stat_bytes;
+  uint32_t pdus = s_stat_pdus;
+  s_stat_notifs = 0;
+  s_stat_bytes = 0;
+  s_stat_pdus = 0;
+
+  int64_t now = esp_timer_get_time();
+  double dt = (now - s_stat_last_us) / 1e6;
+  s_stat_last_us = now;
+
+  if (notifs && dt > 0) {
+    struct ble_gap_conn_desc desc;
+    double itvl_ms = 0;
+    if (ble_gap_conn_find(s_conn_handle, &desc) == 0)
+      itvl_ms = desc.conn_itvl * 1.25;
+    double events = (itvl_ms > 0) ? (dt * 1000.0 / itvl_ms) : 0;
+    double pkts_per_event = (events > 0) ? (pdus / events) : 0;
+    ESP_LOGI(TAG,
+             "tx: %.1f kB/s, %.0f notif/s, ~%.1f LL PDU/conn-event "
+             "(interval=%.2f ms)",
+             bytes / dt / 1000.0, notifs / dt, pkts_per_event, itvl_ms);
+  }
+
+  if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+    ble_npl_callout_reset(&s_stats_co,
+                          ble_npl_time_ms_to_ticks32(NUS_STATS_PERIOD_MS));
 }
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg) {
@@ -158,9 +266,17 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
     if (event->connect.status == 0) {
       s_conn_handle = event->connect.conn_handle;
       s_tx_subscribed = false;
+      s_param_retried = false;
       tx_credits_reset();
       ESP_LOGI(TAG, "connected; handle=%d", s_conn_handle);
+      log_conn_params(s_conn_handle);
       negotiate_fast_params(s_conn_handle);
+      s_stat_notifs = 0;
+      s_stat_bytes = 0;
+      s_stat_pdus = 0;
+      s_stat_last_us = esp_timer_get_time();
+      ble_npl_callout_reset(&s_stats_co,
+                            ble_npl_time_ms_to_ticks32(NUS_STATS_PERIOD_MS));
       if (s_cfg.event_cb)
         s_cfg.event_cb(BLE_NUS_CONNECTED, s_cfg.cb_arg);
     } else {
@@ -173,6 +289,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
     ESP_LOGI(TAG, "disconnected; reason=%d", event->disconnect.reason);
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     s_tx_subscribed = false;
+    ble_npl_callout_stop(&s_stats_co);
+    ble_npl_callout_stop(&s_param_co);
     tx_credits_reset(); // unblock any sender parked on a credit
     if (s_cfg.event_cb)
       s_cfg.event_cb(BLE_NUS_DISCONNECTED, s_cfg.cb_arg);
@@ -199,8 +317,44 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
              event->mtu.value - 3);
     return 0;
 
+  case BLE_GAP_EVENT_DATA_LEN_CHG:
+    // DLE settled: the LL PDU sizes/times the controllers agreed on.
+    ESP_LOGI(TAG, "data len: TX=%dB/%dus RX=%dB/%dus",
+             event->data_len_chg.max_tx_octets,
+             event->data_len_chg.max_tx_time,
+             event->data_len_chg.max_rx_octets,
+             event->data_len_chg.max_rx_time);
+    return 0;
+
   case BLE_GAP_EVENT_CONN_UPDATE:
+    // Fires when a connection-parameter update completes (ours or the peer's).
+    if (event->conn_update.status == 0) {
+      log_conn_params(event->conn_update.conn_handle);
+    } else {
+      ESP_LOGW(TAG, "conn update failed; status=%d",
+               event->conn_update.status);
+      // A collision with the central's own update (HCI 0x23, "LL transaction
+      // collision") is transient: back off briefly and retry once.
+      if (event->conn_update.status ==
+              BLE_HS_HCI_ERR(BLE_ERR_LMP_COLLISION) &&
+          !s_param_retried && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        s_param_retried = true;
+        ble_npl_callout_reset(&s_param_co, ble_npl_time_ms_to_ticks32(500));
+      }
+    }
+    return 0;
+
   case BLE_GAP_EVENT_CONN_UPDATE_REQ:
+    return 0;
+
+  case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+    if (event->phy_updated.status == 0)
+      ESP_LOGI(TAG, "PHY now: TX=%s RX=%s",
+               phy_str(event->phy_updated.tx_phy),
+               phy_str(event->phy_updated.rx_phy));
+    else
+      ESP_LOGW(TAG, "PHY update failed; status=%d",
+               event->phy_updated.status);
     return 0;
 
   case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -303,9 +457,15 @@ esp_err_t ble_nus_init(const ble_nus_config_t *config) {
   ble_hs_cfg.sync_cb = on_sync;
   ble_hs_cfg.reset_cb = on_reset;
 
-  // Request the largest ATT MTU NimBLE supports; the effective value is the
-  // minimum of the two peers' preferences, settled during MTU exchange.
-  int rc = ble_att_set_preferred_mtu(BLE_ATT_MTU_MAX);
+  ble_npl_callout_init(&s_stats_co, nimble_port_get_dflt_eventq(),
+                       stats_timer_cb, NULL);
+  ble_npl_callout_init(&s_param_co, nimble_port_get_dflt_eventq(),
+                       param_retry_cb, NULL);
+
+  // Cap the ATT MTU so each notification is exactly one LL PDU; the effective
+  // value is the minimum of the two peers' preferences, settled during MTU
+  // exchange (see BLE_GAP_EVENT_MTU).
+  int rc = ble_att_set_preferred_mtu(NUS_PREFERRED_MTU);
   if (rc)
     ESP_LOGW(TAG, "set preferred MTU rc=%d", rc);
 
@@ -384,6 +544,11 @@ esp_err_t ble_nus_send(const uint8_t *data, uint16_t len, uint32_t timeout_ms) {
       ESP_LOGW(TAG, "notify rc=%d", rc);
       return ESP_FAIL;
     }
+    // Account this notification for the periodic throughput stats. One LL PDU
+    // per 247 B of L2CAP SDU (ATT PDU = chunk + 3, plus a 4 B L2CAP header).
+    s_stat_notifs++;
+    s_stat_bytes += chunk;
+    s_stat_pdus += (chunk + 3 + 4 + 250) / 251;
     offset += chunk;
   }
   return ESP_OK;
